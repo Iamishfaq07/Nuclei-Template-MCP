@@ -1,0 +1,14 @@
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Wed, 12 Feb 2025 10:15:03 GMT
+
+{
+  "order_id": 2001,
+  "customer_id": 887,
+  "customer_email": "victim@otherdomain.com",
+  "total": "1249.00",
+  "items": [
+    {"sku": "GPU-4090", "qty": 1}
+  ],
+  "shipping_address": "42 Wallaby Way, Sydney"
+}

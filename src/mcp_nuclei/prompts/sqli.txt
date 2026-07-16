@@ -1,0 +1,51 @@
+## Specialized guidance: SQL Injection (SQLi)
+
+You have determined (or been told) that this request demonstrates a SQL
+injection vulnerability. Apply this additional reasoning on top of the
+base instructions:
+
+1. **Identify the injectable parameter** precisely (query string, path
+   segment, form field, JSON field, header, or cookie), and preserve its
+   exact location and surrounding syntax in the template.
+
+2. **Prefer safe, non-destructive proof techniques**, in this order of
+   preference:
+   - **Boolean-based**: two requests (a `true` condition and a `false`
+     condition payload) compared via matchers/response-length heuristics,
+     OR a single payload whose response content differs in a predictable,
+     matchable way from the baseline.
+   - **Error-based**: a payload that triggers a distinctive database error
+     message (e.g. MySQL/PostgreSQL/MSSQL/Oracle syntax error strings)
+     that is safe and reversible.
+   - **Time-based blind** (only if boolean/error-based isn't feasible from
+     the given context): use a modest, safe delay (e.g. ~5 seconds) via
+     `matchers: - type: dsl` comparing `duration`. Avoid large sleep
+     values that could cause timeouts or resemble a DoS.
+   - Avoid UNION-based data extraction payloads that could pull real
+     sensitive data from a production database; a detection template
+     should prove exploitability, not perform full exfiltration.
+
+3. **Never use stacked queries or payloads that modify data**
+   (`INSERT`/`UPDATE`/`DELETE`/`DROP`/`;--` stacked statements). Detection
+   templates must be safe to run repeatedly against production systems.
+
+4. **Matchers**:
+   - For error-based: `type: word` or `type: regex` matching known DB
+     error signatures (e.g. `"SQL syntax.*MySQL"`, `"quoted string not
+     properly terminated"`, `"unterminated quoted string"`,
+     `"PostgreSQL.*ERROR"`), combined with a status matcher if useful.
+   - For boolean-based: consider `matchers-condition: and` across two
+     chained `http` requests (true/false payloads) using a `dsl` matcher
+     comparing content length or a distinctive word present only in the
+     true-condition response.
+   - For time-based: use a `dsl` matcher such as
+     `duration>=5` combined with a control request that responds quickly,
+     to avoid false positives from generally slow endpoints.
+
+5. **Database fingerprinting**: if the error message or behavior reveals
+   the specific database engine, mention it in `info.description` and add
+   a relevant tag (e.g. `mysql`, `postgresql`, `mssql`, `oracle`,
+   `sqlite`).
+
+6. **Tags:** include `sqli`, `injection`, and the identified database
+   engine tag if known.
