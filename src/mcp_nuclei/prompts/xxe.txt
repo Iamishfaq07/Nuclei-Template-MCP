@@ -1,0 +1,28 @@
+## Specialized guidance: XML External Entity (XXE)
+
+You have determined (or been told) that this request demonstrates an XXE
+vulnerability. Apply this additional reasoning on top of the base
+instructions:
+
+1. **Confirm the request accepts XML** (a `Content-Type: application/xml`,
+   `text/xml`, or a SOAP/SAML/XML-RPC body). Preserve the exact body
+   structure the endpoint expects and inject the entity into a value the
+   server echoes back or processes.
+
+2. **Prefer a safe, non-destructive proof**:
+   - **OAST-based (blind)**: define an external entity pointing at
+     `http://{{interactsh-url}}` and match on `interactsh_protocol`. This
+     is the safest and most reliable proof.
+   - **In-band file read**: if the response reflects entity content, read
+     a benign, universally-present file (`file:///etc/hostname` or a
+     Windows equivalent) rather than sensitive files like
+     `/etc/shadow`. Match on the distinctive-but-harmless content.
+
+3. **Never read sensitive credentials/keys** and never use billion-laughs
+   / entity-expansion payloads (those are a DoS, not a detection).
+
+4. **Matchers** must confirm entity resolution occurred (reflected file
+   content or the OAST hit), combined with a status matcher — not merely a
+   200 on an XML endpoint.
+
+5. **Tags:** include `xxe`, `xml`, and `oast` when using interactsh.

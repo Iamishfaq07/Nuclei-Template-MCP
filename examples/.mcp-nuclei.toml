@@ -1,0 +1,17 @@
+# Example mcp-nuclei config file.
+# Copy to ./.mcp-nuclei.toml or ~/.mcp-nuclei.toml to set defaults so you
+# don't have to pass these flags on every invocation. CLI flags always win.
+
+[mcp-nuclei]
+author = "your-handle"
+severity = "medium"
+tags = "mcp-nuclei"
+
+# Backend: "auto" (pick whichever API key is set), "anthropic", or "openai".
+backend = "auto"
+# model = "claude-sonnet-5"   # or e.g. "gpt-4o" for the openai backend
+
+# Run a second self-critique pass to harden every generated template.
+refine = false
+# Ask the model to classify the vuln type when no --type/--description is given.
+auto_classify = false

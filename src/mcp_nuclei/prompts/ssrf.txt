@@ -1,0 +1,28 @@
+## Specialized guidance: Server-Side Request Forgery (SSRF)
+
+You have determined (or been told) that this request demonstrates an SSRF
+vulnerability. Apply this additional reasoning on top of the base
+instructions:
+
+1. **Identify the URL/host sink** — the parameter whose value the server
+   fetches (a `url=`, `next=`, `dest=`, `callback=`, `image=`, webhook, or
+   XML/PDF/preview generator input). Parameterize it as `{{ssrf_url}}` or
+   similar.
+
+2. **Prefer an out-of-band interaction check** using Nuclei's built-in
+   OAST (`{{interactsh-url}}`): set the sink to `http://{{interactsh-url}}`
+   and add a `matchers: - type: word / part: interactsh_protocol` (or
+   `interactsh_request`) matcher. This is the most reliable, lowest-false-
+   positive way to prove blind SSRF.
+
+3. **For non-blind SSRF**, match on evidence the server actually fetched
+   an internal resource (e.g. reflected cloud metadata like
+   `169.254.169.254` responses, an internal service banner, or a
+   distinctive body from an internal endpoint). Match specific content,
+   not a bare 200.
+
+4. **Do not point payloads at real third-party hosts or perform port
+   scans / internal enumeration loops.** Use `{{interactsh-url}}` or an
+   analyst-controlled collaborator only. No large IP/port fuzzing lists.
+
+5. **Tags:** include `ssrf`, and `oast` when using interactsh.

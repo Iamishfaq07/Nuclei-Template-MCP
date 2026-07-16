@@ -1,0 +1,29 @@
+## Specialized guidance: CORS Misconfiguration
+
+You have determined (or been told) that this request demonstrates a CORS
+misconfiguration. Apply this additional reasoning on top of the base
+instructions:
+
+1. **Send an attacker `Origin` header** and inspect how the server's CORS
+   response headers reflect it. The template's request should set
+   `Origin: https://evil.example` (a distinctive marker origin).
+
+2. **Match the dangerous reflection pattern**, using
+   `matchers-condition: and`:
+   - `type: regex` on `part: header` confirming
+     `Access-Control-Allow-Origin` reflects the attacker origin
+     (`Access-Control-Allow-Origin:\s*https://evil\.example`) OR is a
+     wildcard `*`, AND
+   - `type: word` on `part: header` confirming
+     `Access-Control-Allow-Credentials: true` — this is what makes the
+     misconfiguration actually exploitable. Reflecting the origin without
+     credentials is much lower impact; reflect that in `severity`.
+
+3. **Consider the `null` origin and trailing-dot/subdomain tricks** only
+   if the description suggests them; otherwise keep to the confirmed case.
+
+4. **Severity honesty**: origin-reflection + `Allow-Credentials: true` on
+   an endpoint returning sensitive data is `high`; a wildcard ACAO on a
+   public, non-credentialed endpoint is `low`/`info`.
+
+5. **Tags:** include `cors`, `misconfig`.
