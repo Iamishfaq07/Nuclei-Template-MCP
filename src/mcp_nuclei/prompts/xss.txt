@@ -1,0 +1,52 @@
+## Specialized guidance: Cross-Site Scripting (XSS)
+
+You have determined (or been told) that this request demonstrates a
+cross-site scripting vulnerability. Apply this additional reasoning on top
+of the base instructions:
+
+1. **Identify the injection point and reflection context** — is the
+   payload reflected directly into HTML body text, an HTML attribute
+   value, a `<script>` block, a JSON response later rendered unsafely, or
+   an HTTP header (e.g. reflected into a response header or inline
+   error page)? The correct matcher and payload depend heavily on this
+   context.
+
+2. **Use a distinctive, low-risk marker payload**, not a payload designed
+   for real exploitation. Prefer something like:
+   `<script>alert(document.domain)</script>` or a unique, unlikely-to-
+   collide marker string combined with breakout characters relevant to the
+   context (e.g. `"><svg onload=alert(1)>` for an attribute-breakout
+   case). Make the marker unique enough (e.g. include a short random-
+   looking token) that the matcher can't accidentally match unrelated
+   page content.
+
+3. **Distinguish reflected vs. stored vs. DOM-based XSS** if this is
+   discernible from the request/response/description:
+   - Reflected: a single request/response pair is enough — match the
+     unescaped payload appearing verbatim in the response body.
+   - Stored: you may need two chained `http` requests — one to submit the
+     payload, one to load the page where it is later rendered — using
+     Nuclei's request chaining (`req-condition: true` /
+     `matchers-condition: and` across entries, or extractors feeding the
+     next request).
+   - DOM-based: note in `info.description` that server-side templates
+     cannot fully verify DOM sinks, and focus the matcher on confirming
+     the raw, unescaped payload reaches the response (client-side
+     execution cannot be verified by an HTTP-only template).
+
+4. **Matchers must prove the payload is unescaped**, not merely present.
+   Match on the *exact unescaped* payload string (e.g. `<script>` and not
+   `&lt;script&gt;`) appearing in the response body, ideally combined with
+   a `part: body` word/regex matcher plus a status matcher. Consider a
+   `negative` matcher against the HTML-encoded form to reduce false
+   positives on properly-encoding endpoints.
+
+5. **Respect response Content-Type when relevant** — reflection into a
+   `application/json` response is not exploitable the same way as into
+   `text/html`; note this distinction in `info.description` and adjust
+   severity accordingly (reflected XSS into a JSON API response consumed
+   by a JS client can still be significant, but the reasoning should be
+   explicit).
+
+6. **Tags:** include `xss`, and `reflected`, `stored`, or `dom` as
+   appropriate.

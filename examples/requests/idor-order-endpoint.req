@@ -1,0 +1,6 @@
+GET /api/v1/orders/2001 HTTP/1.1
+Host: shop.example.com
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.low-priv-user-1042-token
+Accept: application/json
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
+

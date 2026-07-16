@@ -1,0 +1,47 @@
+## Specialized guidance: Insecure Direct Object Reference (IDOR)
+
+You have determined (or been told) that this request demonstrates an IDOR /
+broken object-level authorization vulnerability. Apply this additional
+reasoning on top of the base instructions:
+
+1. **Identify the object reference.** Find the parameter that identifies
+   the resource — a numeric id, UUID, username, order number, file path,
+   etc. It may be in the URL path, a query string, a header, or the JSON
+   body. Call this out clearly by using a `{{object_id}}`-style variable
+   name in the template where appropriate.
+
+2. **Identify the authorization context.** Note what credential
+   (session cookie, `Authorization` header, API key) is present, and
+   whether the request nonetheless returns data belonging to a different
+   principal than the one implied by that credential. If the response was
+   provided, look for identifying information (another user's email,
+   name, account number, order details) that proves cross-tenant/
+   cross-user access.
+
+3. **Prefer detection over full data dump.** The template should prove
+   *unauthorized access occurred*, not exfiltrate the maximum amount of
+   data. A single distinguishing field is enough (e.g. an email address,
+   a username, an internal id that shouldn't be visible to this caller).
+
+4. **Matchers should target victim-specific data, not just success codes.**
+   A 200 status alone proves nothing — the vulnerable and patched versions
+   of the endpoint likely both return 200 for a valid id. Use `word` or
+   `regex` matchers against response body content that would only appear
+   if you accessed another principal's data (e.g. a field value that
+   differs from anything tied to the requester's own identity).
+
+5. **Consider a negative control when it strengthens the template.** If
+   feasible from the given context, structure the matchers so a
+   *correctly authorized* response (e.g. an explicit 403/401, or a
+   generic "not found") would NOT match — this reduces false positives on
+   patched targets. Use `negative: true` matchers against expected
+   deny-access indicators if you can infer them.
+
+6. **Do not brute-force ranges of ids.** One well-chosen request that
+   demonstrates the boundary violation is sufficient and safer for
+   production targets. Do not add loops, multiple payloads, or fuzzing
+   lists to "increase coverage" unless the analyst's description
+   specifically asks for enumeration behavior.
+
+7. **Tags:** include `idor` and, where relevant, `authorization`,
+   `bac` (broken access control), plus any identifiable technology tags.
