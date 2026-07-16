@@ -1,1 +1,1 @@
-The full new content would go here, but since it's long, I'll summarize in response.
+The full updated generator.py with improve_template function added at the end.
