@@ -1,1 +1,1 @@
-Small consistency improvements in CLI help texts
+Improved error handling and user-friendly messages
