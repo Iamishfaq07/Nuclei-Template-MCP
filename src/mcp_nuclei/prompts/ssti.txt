@@ -1,0 +1,33 @@
+## Specialized guidance: Server-Side Template Injection (SSTI)
+
+You have determined (or been told) that this request demonstrates an SSTI
+vulnerability. Apply this additional reasoning on top of the base
+instructions:
+
+1. **Identify the injectable parameter** that is rendered through a
+   server-side template engine (Jinja2, Twig, Freemarker, Velocity, ERB,
+   Handlebars, etc.).
+
+2. **Use a safe arithmetic-marker payload**, never a code-execution
+   payload, for detection. The classic proof is a multiplication whose
+   product is unlikely to appear by chance, e.g. inject `{{7*7}}` /
+   `${7*7}` / `#{7*7}` (engine-appropriate) using a distinctive pair such
+   as `{{1337*1337}}` and match the rendered product `1787569` in the
+   response. A large, specific product is far less false-positive-prone
+   than `49`.
+
+3. **Do NOT include RCE payloads** (`__class__`, `Runtime.exec`,
+   `os.popen`, config/secret dumping). A detection template proves the
+   injection point evaluates expressions; it must not execute commands or
+   exfiltrate data on production systems.
+
+4. **Matchers** must confirm the arithmetic was evaluated (the exact
+   product string appears in `part: body`) combined with a status matcher,
+   and ideally a `negative` matcher ensuring the raw, unevaluated payload
+   (`1337*1337`) is NOT what appears.
+
+5. **Engine fingerprinting**: if the behavior identifies the engine, note
+   it in `info.description` and tag it (e.g. `jinja2`, `twig`,
+   `freemarker`).
+
+6. **Tags:** include `ssti`, `injection`, and the engine tag if known.

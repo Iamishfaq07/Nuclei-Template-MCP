@@ -1,0 +1,3 @@
+curl 'https://blog.example.com/search?q=test' \
+  -H 'User-Agent: Mozilla/5.0' \
+  -H 'Accept: text/html'

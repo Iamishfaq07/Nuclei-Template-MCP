@@ -1,0 +1,30 @@
+## Specialized guidance: OS Command Injection
+
+You have determined (or been told) that this request demonstrates an OS
+command injection vulnerability. Apply this additional reasoning on top of
+the base instructions:
+
+1. **Identify the injectable parameter** that is passed to a shell/command
+   (a `host=`, `ip=`, `cmd=`, `filename=`, ping/lookup/convert feature).
+
+2. **Prefer safe, non-destructive proof techniques**, in this order:
+   - **OAST-based (blind)**: inject a command that triggers an out-of-band
+     lookup, e.g. `;nslookup {{interactsh-url}}` or
+     `;curl http://{{interactsh-url}}`, and match on `interactsh_protocol`.
+     This is the safest, most reliable proof.
+   - **Echo-marker (in-band)**: inject a command that echoes a unique,
+     unlikely marker (e.g. `;echo NUCLEIxCMDi1337`) and match that exact
+     marker in the response body — proving command execution without
+     touching the filesystem.
+   - **Time-based (last resort)**: a bounded `;sleep 5` matched via a
+     `dsl` `duration>=5` matcher plus a fast control request. Keep the
+     delay modest to avoid resembling a DoS.
+
+3. **Never use destructive commands** (`rm`, `mkfs`, `shutdown`, writing
+   files, fork bombs) and never chain data-exfiltration of real secrets.
+
+4. **Matchers** must confirm command execution (OAST hit, echoed marker,
+   or timing) — never a bare status code.
+
+5. **Tags:** include `cmdi`, `injection`, `rce`, and `oast` when using
+   interactsh.

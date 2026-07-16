@@ -54,14 +54,13 @@ class HttpResponse(HttpMessage):
     reason: str = ""
 
 
-def parse_request_file(path: Path) -> HttpRequest:
-    """Parse a raw HTTP request file (e.g. exported from Burp Suite) into an `HttpRequest`."""
-    if not path.exists():
-        raise ParseError(f"Request file not found: {path}")
+def _parse_request_text(raw: str, source: str = "request") -> HttpRequest:
+    """Parse raw HTTP request text into an `HttpRequest`.
 
-    raw = path.read_text(encoding="utf-8", errors="replace")
+    `source` is used only for error messages (a filename, "curl", etc.).
+    """
     if not raw.strip():
-        raise ParseError(f"Request file is empty: {path}")
+        raise ParseError(f"Request is empty: {source}")
 
     head, body = split_head_body(raw)
     lines = head.split("\n")
@@ -69,7 +68,7 @@ def parse_request_file(path: Path) -> HttpRequest:
     try:
         method, request_path, version = split_request_line(lines[0])
     except MalformedHttpError as exc:
-        raise ParseError(f"Could not parse {path}: {exc}") from exc
+        raise ParseError(f"Could not parse {source}: {exc}") from exc
 
     headers = parse_headers(lines[1:])
     host = headers.get("Host") or headers.get("host")
@@ -87,14 +86,10 @@ def parse_request_file(path: Path) -> HttpRequest:
     )
 
 
-def parse_response_file(path: Path) -> HttpResponse:
-    """Parse a raw HTTP response file into an `HttpResponse`."""
-    if not path.exists():
-        raise ParseError(f"Response file not found: {path}")
-
-    raw = path.read_text(encoding="utf-8", errors="replace")
+def _parse_response_text(raw: str, source: str = "response") -> HttpResponse:
+    """Parse raw HTTP response text into an `HttpResponse`."""
     if not raw.strip():
-        raise ParseError(f"Response file is empty: {path}")
+        raise ParseError(f"Response is empty: {source}")
 
     head, body = split_head_body(raw)
     lines = head.split("\n")
@@ -102,7 +97,7 @@ def parse_response_file(path: Path) -> HttpResponse:
     try:
         _, status_code, reason = split_status_line(lines[0])
     except MalformedHttpError as exc:
-        raise ParseError(f"Could not parse {path}: {exc}") from exc
+        raise ParseError(f"Could not parse {source}: {exc}") from exc
 
     headers = parse_headers(lines[1:])
 
@@ -113,3 +108,17 @@ def parse_response_file(path: Path) -> HttpResponse:
         headers=headers,
         body=body.strip("\n"),
     )
+
+
+def parse_request_file(path: Path) -> HttpRequest:
+    """Parse a raw HTTP request file (e.g. exported from Burp Suite) into an `HttpRequest`."""
+    if not path.exists():
+        raise ParseError(f"Request file not found: {path}")
+    return _parse_request_text(path.read_text(encoding="utf-8", errors="replace"), source=str(path))
+
+
+def parse_response_file(path: Path) -> HttpResponse:
+    """Parse a raw HTTP response file into an `HttpResponse`."""
+    if not path.exists():
+        raise ParseError(f"Response file not found: {path}")
+    return _parse_response_text(path.read_text(encoding="utf-8", errors="replace"), source=str(path))

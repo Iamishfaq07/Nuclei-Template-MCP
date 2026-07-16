@@ -1,0 +1,30 @@
+## Specialized guidance: Authentication / Authorization Bypass
+
+You have determined (or been told) that this request demonstrates an
+authentication or authorization bypass. Apply this additional reasoning on
+top of the base instructions:
+
+1. **Identify the bypass mechanism** — a missing/optional auth header, a
+   forced-browsing to a protected path, a header-based trust bug
+   (`X-Forwarded-For`, `X-Original-URL`, `X-Rewrite-URL`,
+   `X-Forwarded-Host`), a debug/verb-tampering flaw, or a default/weak
+   credential. State it clearly in `info.description`.
+
+2. **Prove access to a protected resource without valid credentials.**
+   The template should send the bypass request WITHOUT the normal auth
+   token/cookie (or with the tampering header) and confirm it still
+   reaches privileged content.
+
+3. **Matchers must target privileged/authenticated-only content**, not a
+   bare 200. Match a distinctive string that only appears on the protected
+   page (an admin panel title, a user-management table, a config value)
+   and combine with a status matcher. Add a `negative` matcher for the
+   login/redirect page where feasible, so a target that correctly
+   redirects to login is NOT flagged.
+
+4. **Be conservative and non-destructive** — do not perform admin actions,
+   change settings, or brute-force credentials. Prove read access to
+   something that should have required auth.
+
+5. **Tags:** include `auth-bypass`, `bac`, and `default-login` when a
+   default credential is involved.

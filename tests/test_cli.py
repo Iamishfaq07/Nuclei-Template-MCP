@@ -38,10 +38,10 @@ def test_version_flag():
 
 
 def test_generate_no_client_configured(request_file: Path, monkeypatch):
-    def _raise():
+    def _raise(backend, model=None):
         raise MCPClientError("no client configured")
 
-    monkeypatch.setattr(cli, "get_default_client", _raise)
+    monkeypatch.setattr(cli, "get_client", _raise)
     result = runner.invoke(cli.app, ["generate", "--request", str(request_file)])
     assert result.exit_code == 1
     assert "MCP client error" in result.stderr
@@ -50,8 +50,8 @@ def test_generate_no_client_configured(request_file: Path, monkeypatch):
 def test_generate_writes_output_file(request_file: Path, tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         cli,
-        "get_default_client",
-        lambda: CallableMCPClient(lambda system, user: STUB_TEMPLATE),
+        "get_client",
+        lambda backend, model=None: CallableMCPClient(lambda system, user: STUB_TEMPLATE),
     )
     output_path = tmp_path / "out.yaml"
 

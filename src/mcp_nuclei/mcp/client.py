@@ -89,19 +89,84 @@ class AnthropicMCPClient:
         return "\n".join(text_parts).strip()
 
 
-def get_default_client() -> MCPClient:
-    """Resolve the default `MCPClient` from the current environment.
+class OpenAIMCPClient:
+    """`MCPClient` backed by an OpenAI-compatible chat completions API.
 
-    Today this resolves to `AnthropicMCPClient` when `ANTHROPIC_API_KEY` is
-    set, since that's the simplest way to run mcp-nuclei end to end. Callers
-    that already have their own MCP agent/session should construct and pass
-    an `MCPClient` implementation directly instead of relying on this.
+    Works with the official OpenAI API and any OpenAI-compatible endpoint
+    (including local servers like Ollama's `/v1` or LM Studio) via the
+    `OPENAI_BASE_URL` env var. Requires the optional `openai` dependency
+    (`pip install mcp-nuclei[openai]`) and an `OPENAI_API_KEY`.
     """
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return AnthropicMCPClient(model=os.environ.get("MCP_NUCLEI_MODEL", "claude-sonnet-5"))
 
-    raise MCPClientError(
-        "No MCP client is configured. Set ANTHROPIC_API_KEY to use the built-in "
-        "Anthropic backend, or pass a custom MCPClient implementation "
-        "programmatically (see mcp_nuclei.mcp.client.MCPClient)."
-    )
+    def __init__(
+        self,
+        model: str = "gpt-4o",
+        max_tokens: int = 4096,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ) -> None:
+        try:
+            import openai
+        except ImportError as exc:
+            raise MCPClientError(
+                "The 'openai' package is required for OpenAIMCPClient. "
+                "Install it with: pip install mcp-nuclei[openai]"
+            ) from exc
+
+        self._client = openai.OpenAI(api_key=api_key, base_url=base_url or os.environ.get("OPENAI_BASE_URL"))
+        self._model = model
+        self._max_tokens = max_tokens
+
+    def generate(self, *, system_prompt: str, user_prompt: str) -> str:
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except Exception as exc:
+            raise MCPClientError(f"OpenAI API request failed: {exc}") from exc
+
+        return (response.choices[0].message.content or "").strip()
+
+
+# Default model per backend, used when none is configured explicitly.
+_DEFAULT_MODELS = {"anthropic": "claude-sonnet-5", "openai": "gpt-4o"}
+
+
+def get_client(backend: str = "auto", model: Optional[str] = None) -> MCPClient:
+    """Resolve an `MCPClient` for the requested backend.
+
+    `backend` may be `"anthropic"`, `"openai"`, or `"auto"` (pick whichever
+    API key is present in the environment). Callers that already have their
+    own MCP agent/session should construct and pass an `MCPClient`
+    implementation directly instead of relying on this.
+    """
+    resolved = backend
+    if backend == "auto":
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            resolved = "anthropic"
+        elif os.environ.get("OPENAI_API_KEY"):
+            resolved = "openai"
+        else:
+            raise MCPClientError(
+                "No MCP client is configured. Set ANTHROPIC_API_KEY or OPENAI_API_KEY "
+                "(or pass --backend and the matching key), or supply a custom MCPClient "
+                "implementation programmatically (see mcp_nuclei.mcp.client.MCPClient)."
+            )
+
+    chosen_model = model or os.environ.get("MCP_NUCLEI_MODEL") or _DEFAULT_MODELS.get(resolved)
+    if resolved == "anthropic":
+        return AnthropicMCPClient(model=chosen_model or _DEFAULT_MODELS["anthropic"])
+    if resolved == "openai":
+        return OpenAIMCPClient(model=chosen_model or _DEFAULT_MODELS["openai"])
+
+    raise MCPClientError(f"Unknown backend {backend!r}; expected 'anthropic', 'openai', or 'auto'")
+
+
+def get_default_client() -> MCPClient:
+    """Backwards-compatible shim resolving the default client (auto backend)."""
+    return get_client("auto")

@@ -1,0 +1,27 @@
+## Specialized guidance: Open Redirect
+
+You have determined (or been told) that this request demonstrates an open
+redirect vulnerability. Apply this additional reasoning on top of the base
+instructions:
+
+1. **Identify the redirect parameter** (`url=`, `next=`, `redirect=`,
+   `return=`, `dest=`, `continue=`, `RelayState=`). Parameterize it with a
+   distinctive attacker-controlled host, e.g. `{{redirect_target}}` set to
+   something like `https://interact.sh` or a unique marker domain.
+
+2. **Match on the redirect actually being honored**, not just a 3xx:
+   - `type: status` matching `301`, `302`, `303`, `307`, or `308`, AND
+   - `type: regex` on `part: header` matching the `Location:` header
+     containing the attacker host verbatim
+     (e.g. `Location:\s*https?://(www\.)?interact\.sh`).
+   - Use `matchers-condition: and` so a redirect back to the same site
+     does not trigger a false positive.
+
+3. **Consider protocol-relative and bypass forms** (`//evil.com`,
+   `https:evil.com`, `/\evil.com`) only if the sample/description suggests
+   naive filtering — otherwise keep to the confirmed working payload.
+
+4. **Do not follow redirects to real third-party sites** in a way that
+   sends data; the marker host is only for matching the `Location` header.
+
+5. **Tags:** include `redirect`, `open-redirect`.

@@ -1,0 +1,27 @@
+## Specialized guidance: Local File Inclusion / Path Traversal (LFI)
+
+You have determined (or been told) that this request demonstrates a local
+file inclusion or path traversal vulnerability. Apply this additional
+reasoning on top of the base instructions:
+
+1. **Identify the file/path parameter** (a `file=`, `path=`, `page=`,
+   `template=`, `download=`, or a path segment). Parameterize the payload.
+
+2. **Use a benign, high-signal target file** whose presence proves
+   traversal without exposing secrets. Prefer `/etc/passwd` on Linux
+   (universally present, non-sensitive) or `C:\Windows\win.ini` on
+   Windows. Do NOT target `/etc/shadow`, private keys, or app config with
+   credentials.
+
+3. **Account for common traversal variations** where reasonable — but keep
+   the template focused. A small set of payloads (`../../../../etc/passwd`,
+   an encoded variant, and a `....//` bypass) is fine; do not turn this
+   into a giant fuzzing wordlist.
+
+4. **Matchers must confirm the file's real content**, not just a 200:
+   - For `/etc/passwd`: `type: regex` matching `root:.*:0:0:` — this is far
+     less false-positive-prone than the word `root`.
+   - For `win.ini`: match `for 16-bit app support` or `[extensions]`.
+   - Combine with a status matcher and consider `part: body`.
+
+5. **Tags:** include `lfi`, and `traversal` where applicable.
