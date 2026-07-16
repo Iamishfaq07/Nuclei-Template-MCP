@@ -1,0 +1,1 @@
+Examples for testing mcp-nuclei with different input formats.
