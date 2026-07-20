@@ -24,6 +24,10 @@ COPY src/ src/
 
 RUN pip install --no-cache-dir ".[llm,openai]"
 
+# Run as a non-root user rather than the image default (root).
+RUN useradd --create-home --shell /usr/sbin/nologin mcpnuclei
+USER mcpnuclei
+
 WORKDIR /work
 ENTRYPOINT ["mcp-nuclei"]
 CMD ["--help"]
