@@ -1,0 +1,70 @@
+name: Generate Nuclei Template
+
+# Manually triggered: generate a Nuclei template from a capture file already
+# committed to the repo (e.g. one added in a PR under examples/requests/ or
+# a path you point at) and attach the result as a downloadable artifact.
+#
+# Requires an ANTHROPIC_API_KEY (or OPENAI_API_KEY, with backend: openai)
+# repository secret. This workflow never runs automatically on push/PR —
+# it only fires when someone explicitly dispatches it, so it never spends
+# API credits without a human asking for it.
+on:
+  workflow_dispatch:
+    inputs:
+      request_path:
+        description: "Path to the capture file (raw/curl/HAR/Burp XML), relative to the repo root"
+        required: true
+      description:
+        description: "Optional vulnerability description"
+        required: false
+        default: ""
+      vuln_type:
+        description: "Optional forced vuln type (idor, sqli, xss, ssrf, xxe, lfi, open-redirect, ssti, auth-bypass, cors, cmdi)"
+        required: false
+        default: ""
+      backend:
+        description: "MCP backend to use"
+        required: false
+        default: "anthropic"
+        type: choice
+        options:
+          - anthropic
+          - openai
+      refine:
+        description: "Run a second self-critique pass"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install mcp-nuclei
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[llm,openai]"
+
+      - name: Generate template
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          ARGS=(generate --request "${{ inputs.request_path }}" --output generated-template.yaml --backend "${{ inputs.backend }}")
+          if [ -n "${{ inputs.description }}" ]; then ARGS+=(--description "${{ inputs.description }}"); fi
+          if [ -n "${{ inputs.vuln_type }}" ]; then ARGS+=(--type "${{ inputs.vuln_type }}"); fi
+          if [ "${{ inputs.refine }}" = "true" ]; then ARGS+=(--refine); fi
+          mcp-nuclei "${ARGS[@]}"
+
+      - name: Upload generated template
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-template
+          path: generated-template.yaml

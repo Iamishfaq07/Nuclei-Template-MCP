@@ -21,8 +21,8 @@ from typing import Optional
 
 try:  # Python 3.11+ ships tomllib in the stdlib.
     import tomllib
-except ModuleNotFoundError:  # pragma: no cover - 3.10 fallback
-    tomllib = None  # type: ignore[assignment]
+except ModuleNotFoundError:  # Python 3.10: fall back to the tomli backport.
+    import tomli as tomllib  # type: ignore[no-redef]
 
 
 @dataclass
@@ -67,12 +67,6 @@ def load_config(explicit: Optional[Path] = None) -> Config:
     path = find_config_file(explicit)
     if path is None:
         return Config()
-
-    if tomllib is None:  # pragma: no cover - only on <3.11 without tomli
-        raise ConfigError(
-            "Reading TOML config requires Python 3.11+ (tomllib). "
-            "Upgrade Python or remove the config file."
-        )
 
     try:
         with path.open("rb") as fh:
