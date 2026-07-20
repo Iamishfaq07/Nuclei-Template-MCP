@@ -1,6 +1,7 @@
 """Command line interface for mcp-nuclei."""
 from __future__ import annotations
 
+import difflib
 import json
 from pathlib import Path
 from typing import Optional
@@ -19,11 +20,15 @@ from mcp_nuclei.core.generator import (
     GenerationError,
     GenerationResult,
     build_prepared_prompt,
+    explain_template,
     generate_from_capture,
     load_captures,
 )
 from mcp_nuclei.core.improver import improve_template
+from mcp_nuclei.core.verify import VerifyResult, verify_yaml
+from mcp_nuclei.mcp.cache import CachingMCPClient
 from mcp_nuclei.mcp.client import MCPClient, MCPClientError, get_client
+from mcp_nuclei.mcp.metering import MeteringMCPClient, UsageTotals
 
 app = typer.Typer(
     name="mcp-nuclei",
@@ -68,6 +73,77 @@ def _client_or_exit(backend: str, model: Optional[str]) -> MCPClient:
     except MCPClientError as exc:
         error_console.print(f"[bold red]MCP client error:[/bold red] {exc}")
         raise typer.Exit(code=1)
+
+
+def _prepare_client(
+    backend: str, model: Optional[str], *, cache: bool, cost: bool
+) -> tuple[MCPClient, Optional[MeteringMCPClient]]:
+    """Resolve a backend client, optionally wrapping it for metering and/or caching.
+
+    Metering wraps the real backend so cache hits (which never call it)
+    don't count towards cost; caching wraps that so a hit short-circuits
+    before either the metered client or the real API is touched.
+    """
+    client: MCPClient = _client_or_exit(backend, model)
+    metering: Optional[MeteringMCPClient] = None
+    if cost:
+        metering = MeteringMCPClient(client)
+        client = metering
+    if cache:
+        client = CachingMCPClient(client)
+    return client, metering
+
+
+def _report_cost(totals: UsageTotals) -> None:
+    if totals.call_count == 0:
+        console.print("[dim]No billable MCP calls were made (cached, or usage unavailable for this backend).[/dim]")
+        return
+    line = f"[dim]{totals.call_count} MCP call(s) · {totals.input_tokens} input / {totals.output_tokens} output tokens"
+    if totals.has_cost_estimate:
+        line += f" · ~${totals.estimated_cost_usd:.4f} estimated"
+    line += "[/dim]"
+    console.print(line)
+
+
+def _report_verify(result: VerifyResult) -> None:
+    if not result.available:
+        console.print(f"[yellow]Live verification skipped:[/yellow] {result.detail}")
+        return
+    if not result.ran:
+        error_console.print(f"[bold red]Live verification failed to run:[/bold red] {result.detail}")
+        return
+    if result.matched:
+        console.print(
+            f"[bold green]Live verification: matched against the target[/bold green] "
+            f"({len(result.matches)} match(es))."
+        )
+    else:
+        console.print(
+            "[bold yellow]Live verification: no match against the target.[/bold yellow] "
+            "The template may be too strict, the target may not be vulnerable, or it may be unreachable."
+        )
+    if result.detail:
+        console.print(f"[dim]{result.detail}[/dim]")
+
+
+def _print_explanation(text: str) -> None:
+    console.print(Panel(text, title="Why this template", border_style="green"))
+
+
+def _render_diff(before: str, after: str, label: str) -> None:
+    lines = list(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"{label} (original)",
+            tofile=f"{label} (improved)",
+        )
+    )
+    if not lines:
+        console.print("[dim]No differences.[/dim]")
+        return
+    syntax = Syntax("".join(lines), "diff", theme="monokai", word_wrap=True)
+    console.print(Panel(syntax, title="diff", border_style="yellow"))
 
 
 def _render_template(result: GenerationResult) -> None:
@@ -144,9 +220,24 @@ def generate(
     validate: bool = typer.Option(
         False, "--validate", help="Validate the result with the local `nuclei` binary if installed."
     ),
+    verify_url: Optional[str] = typer.Option(
+        None, "--verify-url",
+        help="Live-test the template against this URL via the local `nuclei` binary. "
+        "Fires real HTTP requests — only use targets you're authorized to test.",
+    ),
+    verify_args: Optional[str] = typer.Option(
+        None, "--verify-args", help="Extra flags to pass through to `nuclei` during --verify-url (shell-quoted)."
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Print the assembled MCP prompt and exit without calling the backend."
     ),
+    explain: bool = typer.Option(
+        False, "--explain", help="Ask MCP for a short rationale for the template (extra API call)."
+    ),
+    cache: bool = typer.Option(
+        False, "--cache", help="Reuse a cached response for an identical prompt instead of calling the backend."
+    ),
+    cost: bool = typer.Option(False, "--cost", help="Report token usage and estimated cost for this run."),
     as_json: bool = typer.Option(False, "--json", help="Emit the result as JSON."),
     template_id: Optional[str] = typer.Option(None, "--id", help="Explicit template id."),
     author: Optional[str] = typer.Option(None, "--author", help="Author name to embed."),
@@ -186,7 +277,9 @@ def generate(
             console.print(f"[dim]Detected type:[/dim] [bold]{prepared.detected_type}[/bold]")
         return
 
-    client = _client_or_exit(backend or config.backend, model or resolve_model(config))
+    client, metering = _prepare_client(
+        backend or config.backend, model or resolve_model(config), cache=cache, cost=cost
+    )
 
     try:
         with console.status("[bold cyan]Analyzing request and generating template..."):
@@ -201,8 +294,24 @@ def generate(
 
     _emit_result(result, output, show, as_json)
 
+    if explain:
+        try:
+            with console.status("[bold cyan]Explaining template..."):
+                rationale = explain_template(result.template_yaml, capture.request, client)
+            _print_explanation(rationale)
+        except GenerationError as exc:
+            error_console.print(f"[bold red]Failed to generate explanation:[/bold red] {exc}")
+
     if validate:
         _run_validation(result.template_yaml)
+
+    if verify_url:
+        with console.status(f"[bold cyan]Verifying against {verify_url}..."):
+            verify_result = verify_yaml(result.template_yaml, verify_url, extra_args=verify_args)
+        _report_verify(verify_result)
+
+    if cost and metering:
+        _report_cost(metering.totals)
 
 
 @app.command()
@@ -218,6 +327,19 @@ def improve(
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Where to write the improved template."),
     fmt: str = typer.Option("auto", "--format", "-f", help="Format of --request: auto, raw, curl, har, burp."),
     validate: bool = typer.Option(False, "--validate", help="Validate the result with the `nuclei` binary."),
+    verify_url: Optional[str] = typer.Option(
+        None, "--verify-url",
+        help="Live-test the result against this URL via the local `nuclei` binary. "
+        "Fires real HTTP requests — only use targets you're authorized to test.",
+    ),
+    verify_args: Optional[str] = typer.Option(
+        None, "--verify-args", help="Extra flags to pass through to `nuclei` during --verify-url (shell-quoted)."
+    ),
+    diff: bool = typer.Option(False, "--diff", help="Show a diff between the original and improved template."),
+    cache: bool = typer.Option(
+        False, "--cache", help="Reuse a cached response for an identical prompt instead of calling the backend."
+    ),
+    cost: bool = typer.Option(False, "--cost", help="Report token usage and estimated cost for this run."),
     as_json: bool = typer.Option(False, "--json", help="Emit the result as JSON."),
     backend: Optional[str] = typer.Option(None, "--backend", help="MCP backend: auto, anthropic, openai."),
     model: Optional[str] = typer.Option(None, "--model", help="Model id for the chosen backend."),
@@ -226,7 +348,11 @@ def improve(
 ) -> None:
     """Review and harden an existing Nuclei template via MCP-driven critique."""
     config = _load_config_or_exit(config_path)
-    client = _client_or_exit(backend or config.backend, model or resolve_model(config))
+    client, metering = _prepare_client(
+        backend or config.backend, model or resolve_model(config), cache=cache, cost=cost
+    )
+
+    original_text = template.read_text(encoding="utf-8") if diff else None
 
     try:
         with console.status("[bold cyan]Reviewing and improving template..."):
@@ -236,8 +362,20 @@ def improve(
         raise typer.Exit(code=1)
 
     _emit_result(result, output, show, as_json)
+
+    if diff and original_text is not None:
+        _render_diff(original_text, result.template_yaml, template.name)
+
     if validate:
         _run_validation(result.template_yaml)
+
+    if verify_url:
+        with console.status(f"[bold cyan]Verifying against {verify_url}..."):
+            verify_result = verify_yaml(result.template_yaml, verify_url, extra_args=verify_args)
+        _report_verify(verify_result)
+
+    if cost and metering:
+        _report_cost(metering.totals)
 
 
 @app.command()
@@ -256,13 +394,19 @@ def batch(
     author: Optional[str] = typer.Option(None, "--author", help="Author name to embed."),
     severity: Optional[str] = typer.Option(None, "--severity", help="Severity to embed."),
     tags: Optional[str] = typer.Option(None, "--tags", help="Comma-separated tags to merge in."),
+    cache: bool = typer.Option(
+        False, "--cache", help="Reuse cached responses for identical prompts instead of calling the backend."
+    ),
+    cost: bool = typer.Option(False, "--cost", help="Report total token usage and estimated cost for the batch."),
     backend: Optional[str] = typer.Option(None, "--backend", help="MCP backend: auto, anthropic, openai."),
     model: Optional[str] = typer.Option(None, "--model", help="Model id for the chosen backend."),
     config_path: Optional[Path] = typer.Option(None, "--config", help="Path to a config file."),
 ) -> None:
     """Generate templates for every capture file in a directory."""
     config = _load_config_or_exit(config_path)
-    client = _client_or_exit(backend or config.backend, model or resolve_model(config))
+    client, metering = _prepare_client(
+        backend or config.backend, model or resolve_model(config), cache=cache, cost=cost
+    )
 
     try:
         with console.status("[bold cyan]Processing batch..."):
@@ -289,6 +433,10 @@ def batch(
             table.add_row(item.label or item.source.name, "[red]failed[/red]", (item.error or "")[:80])
     console.print(table)
     console.print(f"[bold]{summary.succeeded} succeeded, {summary.failed} failed[/bold]")
+
+    if cost and metering:
+        _report_cost(metering.totals)
+
     if summary.failed and not summary.succeeded:
         raise typer.Exit(code=1)
 

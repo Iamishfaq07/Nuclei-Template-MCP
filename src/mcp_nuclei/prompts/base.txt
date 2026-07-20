@@ -109,6 +109,31 @@ Guidelines for filling this in:
   avoid caching), define it under a top-level `variables:` block or use an
   `extractors` -> later `http` entry chain.
 
+## Multi-step / chained requests
+
+Some vulnerabilities cannot be proven with a single request: authenticate
+then act (CSRF, privileged actions), submit then observe (stored XSS,
+second-order SQLi), or write then read back (stored IDOR). When the
+evidence you were given implies this, use Nuclei's request chaining instead
+of forcing a single-request template that can't actually prove the bug:
+
+- List multiple entries under the same `http:` block, in execution order.
+  Each entry is a separate HTTP transaction; state flows between them via
+  `extractors` with `internal: true` on an earlier entry, referenced as
+  `{{extracted_name}}` in a later entry.
+- Use `matchers-condition: and` at the level of the *final* entry to assert
+  the end-to-end proof (e.g. the payload submitted in step 1 appears
+  unescaped in the page loaded in step 2).
+- Set `req-condition: true` on matchers only when a matcher needs to
+  reference a specific numbered request's response (`part: interactsh_protocol`,
+  or comparing across steps) — otherwise the default (matching the last
+  request) is fine.
+- Keep chains as short as possible: two steps (act, then observe) is almost
+  always enough. Don't add unnecessary intermediate requests.
+- If authentication is required to reach the vulnerable step and the
+  sample request already contains a valid session/token, reuse it directly
+  rather than adding a login step you weren't given evidence for.
+
 ## Output contract
 
 - Respond with ONLY the YAML template. No markdown headers, no

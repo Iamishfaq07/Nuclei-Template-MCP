@@ -237,6 +237,30 @@ def refine_template(template_yaml: str, client: MCPClient) -> str:
         raise GenerationError(f"MCP client failed during refinement: {exc}") from exc
 
 
+def explain_template(template_yaml: str, request: HttpRequest, client: MCPClient) -> str:
+    """Ask MCP for a short, plain-language rationale for a generated template.
+
+    This is a separate, lightweight call (not embedded in the template
+    itself) so the explanation can be shown in the terminal for a human
+    reviewer without polluting the YAML output.
+    """
+    system = (
+        "You are a security engineer explaining a Nuclei template to a teammate. "
+        "In 3-5 concise sentences, explain: (1) why the matchers/extractors chosen "
+        "prove the vulnerability rather than producing a false positive, and "
+        "(2) any notable trade-off or limitation of the template. "
+        "Plain prose only, no YAML, no headers, no bullet points."
+    )
+    user = (
+        f"## Original request\n```http\n{to_raw_nuclei_block(request)}\n```\n\n"
+        f"## Generated template\n```yaml\n{template_yaml}\n```"
+    )
+    try:
+        return client.generate(system_prompt=system, user_prompt=user).strip()
+    except Exception as exc:
+        raise GenerationError(f"MCP client failed while generating an explanation: {exc}") from exc
+
+
 def generate_from_capture(
     capture: RequestCapture,
     *,

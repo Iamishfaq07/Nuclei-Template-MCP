@@ -12,11 +12,21 @@ if you have an `ANTHROPIC_API_KEY` set, but it is just one possible backend.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, runtime_checkable
 
 
 class MCPClientError(Exception):
     """Raised when the configured MCP client cannot produce a response."""
+
+
+@dataclass
+class Usage:
+    """Token usage for the most recent `generate()` call, when available."""
+
+    model: str
+    input_tokens: int
+    output_tokens: int
 
 
 @runtime_checkable
@@ -73,6 +83,7 @@ class AnthropicMCPClient:
         self._client = anthropic.Anthropic(api_key=api_key)
         self._model = model
         self._max_tokens = max_tokens
+        self.last_usage: Optional[Usage] = None
 
     def generate(self, *, system_prompt: str, user_prompt: str) -> str:
         try:
@@ -84,6 +95,14 @@ class AnthropicMCPClient:
             )
         except Exception as exc:
             raise MCPClientError(f"Anthropic API request failed: {exc}") from exc
+
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.last_usage = Usage(
+                model=self._model,
+                input_tokens=getattr(usage, "input_tokens", 0),
+                output_tokens=getattr(usage, "output_tokens", 0),
+            )
 
         text_parts = [block.text for block in response.content if getattr(block, "type", None) == "text"]
         return "\n".join(text_parts).strip()
@@ -116,6 +135,7 @@ class OpenAIMCPClient:
         self._client = openai.OpenAI(api_key=api_key, base_url=base_url or os.environ.get("OPENAI_BASE_URL"))
         self._model = model
         self._max_tokens = max_tokens
+        self.last_usage: Optional[Usage] = None
 
     def generate(self, *, system_prompt: str, user_prompt: str) -> str:
         try:
@@ -129,6 +149,14 @@ class OpenAIMCPClient:
             )
         except Exception as exc:
             raise MCPClientError(f"OpenAI API request failed: {exc}") from exc
+
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.last_usage = Usage(
+                model=self._model,
+                input_tokens=getattr(usage, "prompt_tokens", 0),
+                output_tokens=getattr(usage, "completion_tokens", 0),
+            )
 
         return (response.choices[0].message.content or "").strip()
 
