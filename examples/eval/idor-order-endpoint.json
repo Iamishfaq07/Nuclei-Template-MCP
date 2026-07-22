@@ -1,0 +1,9 @@
+{
+  "name": "idor-order-endpoint",
+  "request_file": "../requests/idor-order-endpoint.req",
+  "response_file": "../requests/idor-order-endpoint.resp",
+  "description": "IDOR in order endpoint - low-priv user can read other customers' orders",
+  "expected_type": "idor",
+  "min_matchers": 1,
+  "required_tags": ["idor"]
+}

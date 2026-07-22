@@ -32,6 +32,7 @@ class TemplateInfo(BaseModel):
     description: Optional[str] = None
     tags: Optional[str] = None
     reference: Optional[list[str]] = None
+    classification: Optional[dict[str, Any]] = None
 
     @field_validator("severity")
     @classmethod
@@ -75,6 +76,8 @@ def normalize_template(
     default_author: str = "mcp-nuclei",
     default_severity: str = "medium",
     tags: Optional[str] = None,
+    cve_id: Optional[str] = None,
+    cwe_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Fill in missing required fields and normalize the template's structure."""
     template = dict(data)
@@ -88,6 +91,14 @@ def normalize_template(
         existing = {t.strip() for t in str(info.get("tags", "")).split(",") if t.strip()}
         requested = {t.strip() for t in tags.split(",") if t.strip()}
         info["tags"] = ",".join(sorted(existing | requested))
+
+    if cve_id or cwe_id:
+        classification = dict(info.get("classification") or {})
+        if cve_id:
+            classification["cve-id"] = cve_id.lower()
+        if cwe_id:
+            classification["cwe-id"] = cwe_id.lower()
+        info["classification"] = classification
 
     try:
         info_model = TemplateInfo(**info)

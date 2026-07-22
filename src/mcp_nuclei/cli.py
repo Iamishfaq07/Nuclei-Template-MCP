@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import difflib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import typer
+import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -16,6 +18,9 @@ from mcp_nuclei import __version__
 from mcp_nuclei.config import Config, ConfigError, load_config, resolve_model
 from mcp_nuclei.core import validator
 from mcp_nuclei.core.batch import run_batch
+from mcp_nuclei.core.builder import BuildError
+from mcp_nuclei.core.dedup import find_duplicates
+from mcp_nuclei.core.eval import run_eval
 from mcp_nuclei.core.generator import (
     GenerationError,
     GenerationResult,
@@ -24,16 +29,24 @@ from mcp_nuclei.core.generator import (
     generate_from_capture,
     load_captures,
 )
+from mcp_nuclei.core.history import RunRecord, default_history_path, list_runs, record_run
 from mcp_nuclei.core.improver import improve_template
-from mcp_nuclei.core.verify import VerifyResult, verify_yaml
+from mcp_nuclei.core.lint import lint_template
+from mcp_nuclei.core.notify import notify_webhook
+from mcp_nuclei.core.parser import ParseError
+from mcp_nuclei.core.verify import VerifyResult, read_targets_file, verify_targets, verify_yaml
+from mcp_nuclei.core.watch import watch_directory
+from mcp_nuclei.core.workflow import build_workflow
+from mcp_nuclei.core.workflow import to_yaml as workflow_to_yaml
 from mcp_nuclei.mcp.cache import CachingMCPClient
 from mcp_nuclei.mcp.client import MCPClient, MCPClientError, get_client
 from mcp_nuclei.mcp.metering import MeteringMCPClient, UsageTotals
+from mcp_nuclei.mcp.retry import RetryingMCPClient
 
 app = typer.Typer(
     name="mcp-nuclei",
     help="Generate high-quality Nuclei templates from raw HTTP requests using MCP-driven reasoning.",
-    add_completion=False,
+    add_completion=True,
     no_args_is_help=True,
 )
 console = Console()
@@ -76,19 +89,23 @@ def _client_or_exit(backend: str, model: Optional[str]) -> MCPClient:
 
 
 def _prepare_client(
-    backend: str, model: Optional[str], *, cache: bool, cost: bool
+    backend: str, model: Optional[str], *, cache: bool, cost: bool, retries: int = 0
 ) -> tuple[MCPClient, Optional[MeteringMCPClient]]:
-    """Resolve a backend client, optionally wrapping it for metering and/or caching.
+    """Resolve a backend client, optionally wrapping it for metering/retry/caching.
 
-    Metering wraps the real backend so cache hits (which never call it)
-    don't count towards cost; caching wraps that so a hit short-circuits
-    before either the metered client or the real API is touched.
+    Layering (outermost first): cache -> retry -> metering -> real backend.
+    A cache hit short-circuits before retry or metering ever run (no real
+    work happened, so nothing to retry and no cost). Metering sits directly
+    on the real client so retried attempts are metered individually and
+    a failed attempt (which raises before returning) is never counted.
     """
     client: MCPClient = _client_or_exit(backend, model)
     metering: Optional[MeteringMCPClient] = None
     if cost:
         metering = MeteringMCPClient(client)
         client = metering
+    if retries > 0:
+        client = RetryingMCPClient(client, max_retries=retries)
     if cache:
         client = CachingMCPClient(client)
     return client, metering
@@ -105,21 +122,57 @@ def _report_cost(totals: UsageTotals) -> None:
     console.print(line)
 
 
-def _report_verify(result: VerifyResult) -> None:
+def _record_history(
+    command: str,
+    result: Optional[GenerationResult],
+    *,
+    backend: str,
+    model: Optional[str],
+    metering: Optional[MeteringMCPClient],
+    source_label: Optional[str],
+) -> None:
+    totals = metering.totals if metering else None
+    record_run(
+        RunRecord(
+            command=command,
+            template_id=(result.template_dict.get("id") if result else None),
+            detected_type=(result.detected_type if result else None),
+            source_label=source_label,
+            backend=backend,
+            model=model,
+            input_tokens=(totals.input_tokens if totals else None),
+            output_tokens=(totals.output_tokens if totals else None),
+            estimated_cost_usd=(totals.estimated_cost_usd if totals and totals.has_cost_estimate else None),
+        )
+    )
+
+
+def _report_verify(result: VerifyResult, *, label: str = "target", expect_no_match: bool = False) -> None:
     if not result.available:
         console.print(f"[yellow]Live verification skipped:[/yellow] {result.detail}")
         return
     if not result.ran:
         error_console.print(f"[bold red]Live verification failed to run:[/bold red] {result.detail}")
         return
+
+    if expect_no_match:
+        if result.matched:
+            error_console.print(
+                f"[bold red]Negative check FAILED against {label}:[/bold red] the template matched "
+                f"({len(result.matches)} match(es)) — this looks like a false positive."
+            )
+        else:
+            console.print(f"[bold green]Negative check passed against {label}:[/bold green] no match, as expected.")
+        return
+
     if result.matched:
         console.print(
-            f"[bold green]Live verification: matched against the target[/bold green] "
+            f"[bold green]Live verification: matched against {label}[/bold green] "
             f"({len(result.matches)} match(es))."
         )
     else:
         console.print(
-            "[bold yellow]Live verification: no match against the target.[/bold yellow] "
+            f"[bold yellow]Live verification: no match against {label}.[/bold yellow] "
             "The template may be too strict, the target may not be vulnerable, or it may be unreachable."
         )
     if result.detail:
@@ -184,6 +237,14 @@ def _emit_result(
         _render_template(result)
 
 
+def _notify_or_warn(webhook: Optional[str], text: str, extra: Optional[dict] = None) -> None:
+    if not webhook:
+        return
+    outcome = notify_webhook(webhook, text, extra=extra)
+    if not outcome.sent:
+        error_console.print(f"[yellow]Webhook notification failed:[/yellow] {outcome.error}")
+
+
 @app.command()
 def generate(
     request: Path = typer.Option(
@@ -193,7 +254,7 @@ def generate(
         exists=True,
         dir_okay=False,
         readable=True,
-        help="Path to a capture file: raw HTTP request, curl command, HAR, or Burp XML.",
+        help="Path to a capture file: raw HTTP request, curl command, HAR, Burp XML, or OpenAPI/Swagger spec.",
     ),
     output: Optional[Path] = typer.Option(
         None, "--output", "-o", help="Where to write the template. Prints to stdout if omitted."
@@ -209,7 +270,7 @@ def generate(
         None, "--type", "-t", help="Force a vuln-specific prompt (idor, sqli, xss, ssrf, xxe, lfi, "
         "open-redirect, ssti, auth-bypass, cors, cmdi). Auto-detected from --description otherwise.",
     ),
-    fmt: str = typer.Option("auto", "--format", "-f", help="Input format: auto, raw, curl, har, burp."),
+    fmt: str = typer.Option("auto", "--format", "-f", help="Input format: auto, raw, curl, har, burp, openapi."),
     auto_classify: Optional[bool] = typer.Option(
         None, "--auto-classify/--no-auto-classify",
         help="Ask MCP to classify the vuln type when no --type/--description hint is given.",
@@ -225,8 +286,17 @@ def generate(
         help="Live-test the template against this URL via the local `nuclei` binary. "
         "Fires real HTTP requests — only use targets you're authorized to test.",
     ),
+    verify_safe_url: Optional[str] = typer.Option(
+        None, "--verify-safe-url",
+        help="Live-test against a known-patched/safe URL and confirm the template does NOT match "
+        "(a false-positive regression check). Fires real HTTP requests.",
+    ),
+    verify_urls_file: Optional[Path] = typer.Option(
+        None, "--verify-urls-file", exists=True, dir_okay=False,
+        help="Verify against every URL listed (one per line) in this file instead of a single --verify-url.",
+    ),
     verify_args: Optional[str] = typer.Option(
-        None, "--verify-args", help="Extra flags to pass through to `nuclei` during --verify-url (shell-quoted)."
+        None, "--verify-args", help="Extra flags to pass through to `nuclei` during verification (shell-quoted)."
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Print the assembled MCP prompt and exit without calling the backend."
@@ -238,11 +308,18 @@ def generate(
         False, "--cache", help="Reuse a cached response for an identical prompt instead of calling the backend."
     ),
     cost: bool = typer.Option(False, "--cost", help="Report token usage and estimated cost for this run."),
+    retries: int = typer.Option(0, "--retries", help="Retry a failed MCP call this many times with backoff."),
+    history: bool = typer.Option(False, "--history", help="Record this run in the local run history (metadata only, no request content)."),
+    notify_webhook_url: Optional[str] = typer.Option(
+        None, "--notify-webhook", help="POST a summary to this webhook URL (Slack-compatible) after completion."
+    ),
     as_json: bool = typer.Option(False, "--json", help="Emit the result as JSON."),
     template_id: Optional[str] = typer.Option(None, "--id", help="Explicit template id."),
     author: Optional[str] = typer.Option(None, "--author", help="Author name to embed."),
     severity: Optional[str] = typer.Option(None, "--severity", help="Severity (info/low/medium/high/critical)."),
     tags: Optional[str] = typer.Option(None, "--tags", help="Comma-separated tags to merge in."),
+    cve_id: Optional[str] = typer.Option(None, "--cve-id", help="Attach a known CVE id to info.classification."),
+    cwe_id: Optional[str] = typer.Option(None, "--cwe-id", help="Attach a known CWE id to info.classification."),
     backend: Optional[str] = typer.Option(None, "--backend", help="MCP backend: auto, anthropic, openai."),
     model: Optional[str] = typer.Option(None, "--model", help="Model id for the chosen backend."),
     config_path: Optional[Path] = typer.Option(None, "--config", help="Path to a config file."),
@@ -255,6 +332,8 @@ def generate(
     tags = tags or config.tags
     refine = config.refine if refine is None else refine
     auto_classify = config.auto_classify if auto_classify is None else auto_classify
+    resolved_backend = backend or config.backend
+    resolved_model = model or resolve_model(config)
 
     try:
         captures = load_captures(request, response_path=response, fmt=fmt)
@@ -277,16 +356,14 @@ def generate(
             console.print(f"[dim]Detected type:[/dim] [bold]{prepared.detected_type}[/bold]")
         return
 
-    client, metering = _prepare_client(
-        backend or config.backend, model or resolve_model(config), cache=cache, cost=cost
-    )
+    client, metering = _prepare_client(resolved_backend, resolved_model, cache=cache, cost=cost, retries=retries)
 
     try:
         with console.status("[bold cyan]Analyzing request and generating template..."):
             result = generate_from_capture(
                 capture, client=client, description=description, vuln_type=vuln_type,
                 template_id=template_id, author=author, severity=severity, tags=tags,
-                auto_classify=auto_classify, refine=bool(refine),
+                auto_classify=auto_classify, refine=bool(refine), cve_id=cve_id, cwe_id=cwe_id,
             )
     except GenerationError as exc:
         error_console.print(f"[bold red]Failed to generate template:[/bold red] {exc}")
@@ -308,10 +385,34 @@ def generate(
     if verify_url:
         with console.status(f"[bold cyan]Verifying against {verify_url}..."):
             verify_result = verify_yaml(result.template_yaml, verify_url, extra_args=verify_args)
-        _report_verify(verify_result)
+        _report_verify(verify_result, label=verify_url)
+
+    if verify_safe_url:
+        with console.status(f"[bold cyan]Checking for false positives against {verify_safe_url}..."):
+            safe_result = verify_yaml(result.template_yaml, verify_safe_url, extra_args=verify_args)
+        _report_verify(safe_result, label=verify_safe_url, expect_no_match=True)
+
+    if verify_urls_file:
+        urls = read_targets_file(verify_urls_file)
+        with console.status(f"[bold cyan]Verifying against {len(urls)} target(s)..."):
+            multi_results = verify_targets(result.template_yaml, urls, extra_args=verify_args)
+        matched = sum(1 for r in multi_results.values() if r.matched)
+        console.print(f"[bold]{matched}/{len(urls)} target(s) matched.[/bold]")
+        for url, r in multi_results.items():
+            status = "[green]matched[/green]" if r.matched else "[yellow]no match[/yellow]"
+            console.print(f"  {url}: {status}")
 
     if cost and metering:
         _report_cost(metering.totals)
+
+    if history:
+        _record_history("generate", result, backend=resolved_backend, model=resolved_model, metering=metering, source_label=request.name)
+
+    _notify_or_warn(
+        notify_webhook_url,
+        f"mcp-nuclei generate: {result.template_dict.get('id')} ({result.detected_type or 'unclassified'})",
+        extra={"template_id": result.template_dict.get("id"), "source": request.name},
+    )
 
 
 @app.command()
@@ -325,21 +426,27 @@ def improve(
         help="Optional original capture file for extra context.",
     ),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Where to write the improved template."),
-    fmt: str = typer.Option("auto", "--format", "-f", help="Format of --request: auto, raw, curl, har, burp."),
+    fmt: str = typer.Option("auto", "--format", "-f", help="Format of --request: auto, raw, curl, har, burp, openapi."),
     validate: bool = typer.Option(False, "--validate", help="Validate the result with the `nuclei` binary."),
     verify_url: Optional[str] = typer.Option(
         None, "--verify-url",
         help="Live-test the result against this URL via the local `nuclei` binary. "
         "Fires real HTTP requests — only use targets you're authorized to test.",
     ),
+    verify_safe_url: Optional[str] = typer.Option(
+        None, "--verify-safe-url",
+        help="Live-test against a known-patched/safe URL and confirm the template does NOT match.",
+    ),
     verify_args: Optional[str] = typer.Option(
-        None, "--verify-args", help="Extra flags to pass through to `nuclei` during --verify-url (shell-quoted)."
+        None, "--verify-args", help="Extra flags to pass through to `nuclei` during verification (shell-quoted)."
     ),
     diff: bool = typer.Option(False, "--diff", help="Show a diff between the original and improved template."),
     cache: bool = typer.Option(
         False, "--cache", help="Reuse a cached response for an identical prompt instead of calling the backend."
     ),
     cost: bool = typer.Option(False, "--cost", help="Report token usage and estimated cost for this run."),
+    retries: int = typer.Option(0, "--retries", help="Retry a failed MCP call this many times with backoff."),
+    history: bool = typer.Option(False, "--history", help="Record this run in the local run history."),
     as_json: bool = typer.Option(False, "--json", help="Emit the result as JSON."),
     backend: Optional[str] = typer.Option(None, "--backend", help="MCP backend: auto, anthropic, openai."),
     model: Optional[str] = typer.Option(None, "--model", help="Model id for the chosen backend."),
@@ -348,9 +455,9 @@ def improve(
 ) -> None:
     """Review and harden an existing Nuclei template via MCP-driven critique."""
     config = _load_config_or_exit(config_path)
-    client, metering = _prepare_client(
-        backend or config.backend, model or resolve_model(config), cache=cache, cost=cost
-    )
+    resolved_backend = backend or config.backend
+    resolved_model = model or resolve_model(config)
+    client, metering = _prepare_client(resolved_backend, resolved_model, cache=cache, cost=cost, retries=retries)
 
     original_text = template.read_text(encoding="utf-8") if diff else None
 
@@ -372,10 +479,18 @@ def improve(
     if verify_url:
         with console.status(f"[bold cyan]Verifying against {verify_url}..."):
             verify_result = verify_yaml(result.template_yaml, verify_url, extra_args=verify_args)
-        _report_verify(verify_result)
+        _report_verify(verify_result, label=verify_url)
+
+    if verify_safe_url:
+        with console.status(f"[bold cyan]Checking for false positives against {verify_safe_url}..."):
+            safe_result = verify_yaml(result.template_yaml, verify_safe_url, extra_args=verify_args)
+        _report_verify(safe_result, label=verify_safe_url, expect_no_match=True)
 
     if cost and metering:
         _report_cost(metering.totals)
+
+    if history:
+        _record_history("improve", result, backend=resolved_backend, model=resolved_model, metering=metering, source_label=template.name)
 
 
 @app.command()
@@ -386,7 +501,7 @@ def batch(
     output_dir: Path = typer.Option(
         ..., "--output-dir", "-O", help="Directory to write generated templates into."
     ),
-    fmt: str = typer.Option("auto", "--format", "-f", help="Input format: auto, raw, curl, har, burp."),
+    fmt: str = typer.Option("auto", "--format", "-f", help="Input format: auto, raw, curl, har, burp, openapi."),
     refine: Optional[bool] = typer.Option(None, "--refine/--no-refine", help="Run a self-critique pass on each."),
     auto_classify: Optional[bool] = typer.Option(
         None, "--auto-classify/--no-auto-classify", help="Classify each request's vuln type via MCP."
@@ -394,19 +509,25 @@ def batch(
     author: Optional[str] = typer.Option(None, "--author", help="Author name to embed."),
     severity: Optional[str] = typer.Option(None, "--severity", help="Severity to embed."),
     tags: Optional[str] = typer.Option(None, "--tags", help="Comma-separated tags to merge in."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Number of captures to process concurrently."),
     cache: bool = typer.Option(
         False, "--cache", help="Reuse cached responses for identical prompts instead of calling the backend."
     ),
     cost: bool = typer.Option(False, "--cost", help="Report total token usage and estimated cost for the batch."),
+    retries: int = typer.Option(0, "--retries", help="Retry a failed MCP call this many times with backoff."),
+    history: bool = typer.Option(False, "--history", help="Record this run in the local run history."),
+    notify_webhook_url: Optional[str] = typer.Option(
+        None, "--notify-webhook", help="POST a summary to this webhook URL (Slack-compatible) after completion."
+    ),
     backend: Optional[str] = typer.Option(None, "--backend", help="MCP backend: auto, anthropic, openai."),
     model: Optional[str] = typer.Option(None, "--model", help="Model id for the chosen backend."),
     config_path: Optional[Path] = typer.Option(None, "--config", help="Path to a config file."),
 ) -> None:
     """Generate templates for every capture file in a directory."""
     config = _load_config_or_exit(config_path)
-    client, metering = _prepare_client(
-        backend or config.backend, model or resolve_model(config), cache=cache, cost=cost
-    )
+    resolved_backend = backend or config.backend
+    resolved_model = model or resolve_model(config)
+    client, metering = _prepare_client(resolved_backend, resolved_model, cache=cache, cost=cost, retries=retries)
 
     try:
         with console.status("[bold cyan]Processing batch..."):
@@ -416,6 +537,7 @@ def batch(
                 tags=tags or config.tags,
                 auto_classify=config.auto_classify if auto_classify is None else auto_classify,
                 refine=config.refine if refine is None else refine,
+                max_workers=max(1, workers),
             )
     except GenerationError as exc:
         error_console.print(f"[bold red]Batch failed:[/bold red] {exc}")
@@ -437,8 +559,248 @@ def batch(
     if cost and metering:
         _report_cost(metering.totals)
 
+    if history:
+        for item in summary.items:
+            _record_history(
+                "batch", item.result, backend=resolved_backend, model=resolved_model,
+                metering=None, source_label=item.label or item.source.name,
+            )
+        if cost and metering:
+            _record_history("batch-total", None, backend=resolved_backend, model=resolved_model, metering=metering, source_label=str(directory))
+
+    _notify_or_warn(
+        notify_webhook_url,
+        f"mcp-nuclei batch on {directory}: {summary.succeeded} succeeded, {summary.failed} failed",
+        extra={"succeeded": summary.succeeded, "failed": summary.failed},
+    )
+
     if summary.failed and not summary.succeeded:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def watch(
+    directory: Path = typer.Option(
+        ..., "--dir", "-D", exists=True, file_okay=False, help="Directory to watch for new/changed capture files."
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", "-O", help="Directory to write generated templates into. Prints to stdout if omitted."
+    ),
+    fmt: str = typer.Option("auto", "--format", "-f", help="Input format: auto, raw, curl, har, burp, openapi."),
+    poll_interval: float = typer.Option(2.0, "--poll-interval", help="Seconds between directory scans."),
+    process_existing: bool = typer.Option(
+        False, "--process-existing", help="Also process files already present when watch mode starts."
+    ),
+    refine: Optional[bool] = typer.Option(None, "--refine/--no-refine", help="Run a self-critique pass on each."),
+    auto_classify: Optional[bool] = typer.Option(
+        None, "--auto-classify/--no-auto-classify", help="Classify each request's vuln type via MCP."
+    ),
+    author: Optional[str] = typer.Option(None, "--author", help="Author name to embed."),
+    severity: Optional[str] = typer.Option(None, "--severity", help="Severity to embed."),
+    tags: Optional[str] = typer.Option(None, "--tags", help="Comma-separated tags to merge in."),
+    backend: Optional[str] = typer.Option(None, "--backend", help="MCP backend: auto, anthropic, openai."),
+    model: Optional[str] = typer.Option(None, "--model", help="Model id for the chosen backend."),
+    config_path: Optional[Path] = typer.Option(None, "--config", help="Path to a config file."),
+) -> None:
+    """Watch a directory and generate a template whenever a new capture appears (Ctrl+C to stop)."""
+    config = _load_config_or_exit(config_path)
+    client, _ = _prepare_client(backend or config.backend, model or resolve_model(config), cache=False, cost=False)
+
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    console.print(f"[bold cyan]Watching {directory} for new captures...[/bold cyan] (Ctrl+C to stop)")
+    try:
+        for item in watch_directory(
+            directory,
+            client=client,
+            output_dir=output_dir,
+            fmt=fmt,
+            author=author or config.author,
+            severity=severity or config.severity,
+            tags=tags or config.tags,
+            auto_classify=config.auto_classify if auto_classify is None else auto_classify,
+            refine=config.refine if refine is None else refine,
+            poll_interval=poll_interval,
+            process_existing=process_existing,
+        ):
+            if item.ok and item.result is not None:
+                console.print(f"[green]✓[/green] {item.label} -> {item.output_path or item.result.template_dict.get('id')}")
+            else:
+                error_console.print(f"[red]✗[/red] {item.label}: {item.error}")
+    except KeyboardInterrupt:
+        console.print("\n[dim]Stopped.[/dim]")
+
+
+@app.command()
+def lint(
+    template: Path = typer.Option(
+        ..., "--template", "-i", exists=True, dir_okay=False, readable=True,
+        help="Path to a Nuclei template to lint.",
+    ),
+) -> None:
+    """Check a template against nuclei-templates style conventions (id format, tags, matchers, etc.)."""
+    try:
+        data = yaml.safe_load(template.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        error_console.print(f"[bold red]Invalid YAML:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+    if not isinstance(data, dict):
+        error_console.print("[bold red]Template is not a YAML mapping at the top level.[/bold red]")
+        raise typer.Exit(code=1)
+
+    issues = lint_template(data)
+    if not issues:
+        console.print("[bold green]No lint issues found.[/bold green]")
+        return
+
+    table = Table(title=f"Lint results for {template.name}")
+    table.add_column("Level")
+    table.add_column("Message")
+    for issue in issues:
+        level_style = "[bold red]error[/bold red]" if issue.level == "error" else "[yellow]warning[/yellow]"
+        table.add_row(level_style, issue.message)
+    console.print(table)
+
+    if any(i.level == "error" for i in issues):
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def workflow(
+    templates: list[Path] = typer.Option(
+        ..., "--template", "-i", exists=True, dir_okay=False, readable=True,
+        help="A template to include in the workflow. Repeat for multiple templates, in run order.",
+    ),
+    workflow_id: str = typer.Option(..., "--id", help="Id for the generated workflow."),
+    name: str = typer.Option(..., "--name", help="Name for the generated workflow."),
+    author: str = typer.Option("mcp-nuclei", "--author", help="Author name to embed."),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Where to write the workflow YAML."),
+) -> None:
+    """Combine several existing templates into a Nuclei workflow file."""
+    try:
+        wf = build_workflow(templates, workflow_id=workflow_id, name=name, author=author)
+    except (BuildError, ParseError) as exc:
+        error_console.print(f"[bold red]Failed to build workflow:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    rendered = workflow_to_yaml(wf)
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered, encoding="utf-8")
+        console.print(f"[bold green]Workflow written to[/bold green] {output}")
+    else:
+        console.print(Syntax(rendered, "yaml", theme="monokai", word_wrap=True))
+
+
+@app.command()
+def dedup(
+    template: Path = typer.Option(
+        ..., "--template", "-i", exists=True, dir_okay=False, readable=True,
+        help="Path to a (usually newly generated) template to check.",
+    ),
+    against: Path = typer.Option(
+        ..., "--against", exists=True, file_okay=False,
+        help="Local directory of existing templates to search (e.g. a nuclei-templates checkout).",
+    ),
+    threshold: float = typer.Option(0.3, "--threshold", help="Minimum similarity score (0-1) to report."),
+) -> None:
+    """Check a template against a local directory for likely near-duplicates."""
+    try:
+        data = yaml.safe_load(template.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        error_console.print(f"[bold red]Invalid YAML:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+    if not isinstance(data, dict):
+        error_console.print("[bold red]Template is not a YAML mapping at the top level.[/bold red]")
+        raise typer.Exit(code=1)
+
+    matches = find_duplicates(data, against, threshold=threshold)
+    if not matches:
+        console.print("[bold green]No likely duplicates found.[/bold green]")
+        return
+
+    table = Table(title="Possible duplicates")
+    table.add_column("Score")
+    table.add_column("Template")
+    table.add_column("Path")
+    table.add_column("Why")
+    for match in matches:
+        table.add_row(f"{match.score:.2f}", match.template_id, str(match.path), "; ".join(match.reasons))
+    console.print(table)
+
+
+@app.command(name="eval")
+def eval_prompts(
+    fixtures: Path = typer.Option(
+        ..., "--fixtures", exists=True, file_okay=False, help="Directory of *.json fixture files."
+    ),
+    backend: Optional[str] = typer.Option(None, "--backend", help="MCP backend: auto, anthropic, openai."),
+    model: Optional[str] = typer.Option(None, "--model", help="Model id for the chosen backend."),
+    config_path: Optional[Path] = typer.Option(None, "--config", help="Path to a config file."),
+) -> None:
+    """Replay fixture requests through generation and check structural expectations (prompt regression check)."""
+    config = _load_config_or_exit(config_path)
+    client, _ = _prepare_client(backend or config.backend, model or resolve_model(config), cache=False, cost=False)
+
+    try:
+        with console.status("[bold cyan]Running eval fixtures..."):
+            outcomes = run_eval(fixtures, client)
+    except (NotADirectoryError, ValueError) as exc:
+        error_console.print(f"[bold red]Failed to load fixtures:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    table = Table(title="Eval results")
+    table.add_column("Case")
+    table.add_column("Status")
+    table.add_column("Details")
+    failed = 0
+    for outcome in outcomes:
+        if outcome.passed:
+            table.add_row(outcome.case.name, "[green]pass[/green]", outcome.template_id or "-")
+        else:
+            failed += 1
+            details = outcome.error or "; ".join(outcome.reasons)
+            table.add_row(outcome.case.name, "[red]fail[/red]", details)
+    console.print(table)
+    console.print(f"[bold]{len(outcomes) - failed}/{len(outcomes)} passed[/bold]")
+
+    if failed:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def history(
+    limit: int = typer.Option(20, "--limit", help="Maximum number of runs to show."),
+) -> None:
+    """Show recent runs recorded with --history (metadata only, stored locally)."""
+    records = list_runs(limit=limit)
+    if not records:
+        console.print(
+            f"[dim]No history recorded yet. Pass --history on generate/improve/batch to log runs "
+            f"(stored at {default_history_path()}).[/dim]"
+        )
+        return
+
+    table = Table(title="Run history")
+    table.add_column("When")
+    table.add_column("Command")
+    table.add_column("Template")
+    table.add_column("Type")
+    table.add_column("Source")
+    table.add_column("Tokens")
+    table.add_column("Cost")
+    for record in records:
+        when = datetime.fromtimestamp(record.timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        tokens = (
+            f"{record.input_tokens}/{record.output_tokens}"
+            if record.input_tokens is not None
+            else "-"
+        )
+        cost = f"${record.estimated_cost_usd:.4f}" if record.estimated_cost_usd is not None else "-"
+        table.add_row(when, record.command, record.template_id or "-", record.detected_type or "-",
+                      record.source_label or "-", tokens, cost)
+    console.print(table)
 
 
 @app.command()

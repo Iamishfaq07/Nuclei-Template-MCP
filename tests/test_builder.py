@@ -45,6 +45,24 @@ def test_normalize_template_merges_tags():
     assert normalized["info"]["tags"] == "bac,idor"
 
 
+def test_normalize_template_adds_classification():
+    data = {"info": {"name": "x"}, "http": []}
+    normalized = builder.normalize_template(data, fallback_name="x", cve_id="CVE-2024-12345", cwe_id="CWE-639")
+    assert normalized["info"]["classification"] == {"cve-id": "cve-2024-12345", "cwe-id": "cwe-639"}
+
+
+def test_normalize_template_no_classification_when_not_requested():
+    data = {"info": {"name": "x"}, "http": []}
+    normalized = builder.normalize_template(data, fallback_name="x")
+    assert "classification" not in normalized["info"]
+
+
+def test_normalize_template_preserves_existing_classification():
+    data = {"info": {"name": "x", "classification": {"cve-id": "cve-2020-0001"}}, "http": []}
+    normalized = builder.normalize_template(data, fallback_name="x", cwe_id="CWE-89")
+    assert normalized["info"]["classification"] == {"cve-id": "cve-2020-0001", "cwe-id": "cwe-89"}
+
+
 def test_normalize_template_rejects_bad_severity():
     data = {"info": {"name": "x", "severity": "extreme"}, "http": []}
     with pytest.raises(builder.BuildError):

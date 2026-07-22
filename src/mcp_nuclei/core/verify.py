@@ -98,3 +98,27 @@ def verify_yaml(
         raw_output=raw,
         detail=detail,
     )
+
+
+def verify_targets(
+    template_yaml: str,
+    target_urls: list[str],
+    *,
+    timeout: int = 30,
+    extra_args: Optional[str] = None,
+) -> dict[str, VerifyResult]:
+    """Run `verify_yaml` against each of several targets, keyed by URL.
+
+    Useful for sanity-checking a template across a small list of hosts
+    (e.g. a handful of assets you're authorized to test) rather than one at
+    a time.
+    """
+    return {
+        url: verify_yaml(template_yaml, url, timeout=timeout, extra_args=extra_args) for url in target_urls
+    }
+
+
+def read_targets_file(path: Path) -> list[str]:
+    """Read one target URL per non-empty, non-comment line from a file."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
