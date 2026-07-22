@@ -50,6 +50,11 @@ info:
   tags: comma,separated,relevant,tags
   reference:
     - https://example.com/optional-writeup-or-cwe-reference
+  # Only include classification if the request/response/description gives
+  # you a real, specific CVE or CWE — never guess or invent an identifier.
+  # classification:
+  #   cve-id: CVE-2024-12345
+  #   cwe-id: CWE-639
 
 http:
   - method: GET
@@ -133,6 +138,22 @@ of forcing a single-request template that can't actually prove the bug:
 - If authentication is required to reach the vulnerable step and the
   sample request already contains a valid session/token, reuse it directly
   rather than adding a login step you weren't given evidence for.
+
+## Non-HTTP protocol blocks
+
+Most captures are plain HTTP, so `http:` is almost always the right block.
+If the description or request clearly indicates a different protocol,
+use Nuclei's dedicated block instead of forcing it into `http:`:
+
+- `websocket:` for a vulnerability that only manifests over a WebSocket
+  connection (e.g. an unauthenticated or origin-unchecked WS endpoint).
+  Use `address`, `inputs` (messages to send, in order), and `matchers`
+  against the received frames.
+- `network:` for raw TCP/UDP protocol issues.
+- Multipart form-data bodies (file upload endpoints) work fine under
+  `http:`'s `raw` request form — preserve the `Content-Type:
+  multipart/form-data; boundary=...` header and the exact boundary
+  markers in the body verbatim; do not simplify or re-encode them.
 
 ## Output contract
 

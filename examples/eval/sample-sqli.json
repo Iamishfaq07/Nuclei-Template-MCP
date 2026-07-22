@@ -1,0 +1,8 @@
+{
+  "name": "sample-sqli",
+  "request_file": "../requests/sample-sqli.req",
+  "description": "SQL injection via the 'q' search parameter",
+  "expected_type": "sqli",
+  "min_matchers": 1,
+  "required_tags": ["sqli"]
+}

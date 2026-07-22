@@ -20,8 +20,10 @@ import shlex
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlsplit
+
+import yaml
 
 from mcp_nuclei.core.parser import (
     HttpRequest,
@@ -42,7 +44,15 @@ class RequestCapture:
 
 
 # Formats we can auto-detect and import.
-SUPPORTED_FORMATS = ("raw", "curl", "har", "burp")
+SUPPORTED_FORMATS = ("raw", "curl", "har", "burp", "openapi")
+
+
+def _looks_like_openapi(text: str) -> bool:
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return False
+    return isinstance(data, dict) and ("openapi" in data or "swagger" in data)
 
 
 def detect_format(path: Path) -> str:
@@ -62,6 +72,8 @@ def detect_format(path: Path) -> str:
         return "burp"
     if text.startswith("curl ") or text.startswith("curl\t"):
         return "curl"
+    if suffix in {".json", ".yaml", ".yml"} and _looks_like_openapi(text):
+        return "openapi"
     return "raw"
 
 
@@ -85,6 +97,8 @@ def import_file(path: Path, fmt: str = "auto") -> list[RequestCapture]:
         return parse_har(text)
     if resolved == "burp":
         return parse_burp_xml(text)
+    if resolved == "openapi":
+        return parse_openapi(text)
 
     raise ParseError(f"Unknown format {resolved!r}; expected one of {SUPPORTED_FORMATS} or 'auto'")
 
@@ -297,3 +311,144 @@ def _decode_burp_field(element: ET.Element) -> str:
         except (binascii.Error, ValueError) as exc:
             raise ParseError(f"Could not base64-decode Burp field: {exc}") from exc
     return raw
+
+
+# --------------------------------------------------------------------------- #
+# OpenAPI / Swagger
+# --------------------------------------------------------------------------- #
+
+
+def _example_for_schema(schema: Any) -> Any:
+    """Produce a plausible example value for a JSON Schema fragment."""
+    if not isinstance(schema, dict):
+        return "example"
+    if "example" in schema:
+        return schema["example"]
+    if "default" in schema:
+        return schema["default"]
+    enum = schema.get("enum")
+    if enum:
+        return enum[0]
+
+    schema_type = schema.get("type", "string")
+    if schema_type in ("integer", "number"):
+        return 1
+    if schema_type == "boolean":
+        return True
+    if schema_type == "array":
+        return [_example_for_schema(schema.get("items", {}))]
+    if schema_type == "object":
+        props = schema.get("properties", {})
+        return {name: _example_for_schema(sub) for name, sub in props.items()}
+    return "example"
+
+
+def _param_schema(param: dict[str, Any]) -> dict[str, Any]:
+    """Return the schema for a parameter, supporting both OAS3 (`schema`) and Swagger 2.0 (inline `type`)."""
+    return param.get("schema") or {k: v for k, v in param.items() if k in ("type", "enum", "default", "example")}
+
+
+def _openapi_host(spec: dict[str, Any]) -> tuple[str, str]:
+    """Return (scheme, host) from an OAS3 `servers` list or a Swagger 2.0 `host`/`schemes`."""
+    servers = spec.get("servers")
+    if servers and isinstance(servers, list):
+        url = servers[0].get("url", "")
+        split = urlsplit(url if "://" in url else f"https://{url}")
+        if split.netloc:
+            return split.scheme or "https", split.netloc
+
+    host = spec.get("host")
+    if host:
+        schemes = spec.get("schemes") or ["https"]
+        return schemes[0], host
+
+    return "https", "{{Hostname}}"
+
+
+def _openapi_request_body(operation: dict[str, Any]) -> tuple[str, str]:
+    """Return (content_type, body_text) for an operation's request body, if any."""
+    request_body = operation.get("requestBody")
+    if isinstance(request_body, dict):
+        content = request_body.get("content", {})
+        for content_type, media in content.items():
+            example = media.get("example")
+            if example is None:
+                example = _example_for_schema(media.get("schema", {}))
+            return content_type, json.dumps(example)
+        return "", ""
+
+    # Swagger 2.0: body carried as a `parameters` entry with `in: body`.
+    for param in operation.get("parameters", []):
+        if isinstance(param, dict) and param.get("in") == "body":
+            example = _example_for_schema(param.get("schema", {}))
+            return "application/json", json.dumps(example)
+    return "", ""
+
+
+def parse_openapi(text: str) -> list[RequestCapture]:
+    """Parse an OpenAPI 3.x or Swagger 2.0 spec into one `RequestCapture` per operation."""
+    try:
+        spec = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ParseError(f"Invalid OpenAPI/Swagger document: {exc}") from exc
+
+    if not isinstance(spec, dict) or "paths" not in spec:
+        raise ParseError("OpenAPI/Swagger document has no 'paths' section")
+
+    scheme, host = _openapi_host(spec)
+    base_path = spec.get("basePath", "") if "swagger" in spec else ""
+
+    captures: list[RequestCapture] = []
+    for raw_path, path_item in (spec.get("paths") or {}).items():
+        if not isinstance(path_item, dict):
+            continue
+        shared_params = path_item.get("parameters", [])
+
+        for method, operation in path_item.items():
+            if method.lower() not in ("get", "post", "put", "delete", "patch", "head", "options"):
+                continue
+            if not isinstance(operation, dict):
+                continue
+
+            params = shared_params + operation.get("parameters", [])
+            resolved_path = base_path + raw_path
+            headers: dict[str, str] = {}
+            query_parts: list[str] = []
+
+            for param in params:
+                if not isinstance(param, dict):
+                    continue
+                location = param.get("in")
+                name = param.get("name", "")
+                value = _example_for_schema(_param_schema(param))
+                if location == "path":
+                    resolved_path = resolved_path.replace(f"{{{name}}}", str(value))
+                elif location == "query":
+                    query_parts.append(f"{name}={value}")
+                elif location == "header":
+                    headers[name] = str(value)
+
+            if query_parts:
+                resolved_path = f"{resolved_path}?{'&'.join(query_parts)}"
+
+            content_type, body = _openapi_request_body(operation)
+            if content_type:
+                headers.setdefault("Content-Type", content_type)
+            headers.setdefault("Host", host)
+
+            header_lines = "\n".join(f"{k}: {v}" for k, v in headers.items())
+            raw_request = f"{method.upper()} {resolved_path} HTTP/1.1\n{header_lines}\n\n{body}".strip() + "\n"
+
+            try:
+                request = _parse_request_text(raw_request, source=f"openapi[{method.upper()} {raw_path}]")
+            except ParseError:
+                continue
+            request.scheme = scheme
+
+            summary = operation.get("summary") or operation.get("operationId") or ""
+            label = f"{method.upper()} {raw_path}" + (f" - {summary}" if summary else "")
+            captures.append(RequestCapture(request=request, label=label))
+
+    if not captures:
+        raise ParseError("OpenAPI/Swagger document did not yield any usable operations")
+    return captures

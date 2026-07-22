@@ -18,6 +18,7 @@ from mcp_nuclei.core.parser import (
     ParseError,
     parse_response_file,
 )
+from mcp_nuclei.core.plugins import load_plugin_prompts
 from mcp_nuclei.mcp.client import MCPClient
 from mcp_nuclei.utils.http import to_raw_nuclei_block
 
@@ -52,6 +53,24 @@ _VULN_KEYWORDS: dict[str, tuple[str, ...]] = {
     "cors": ("cors", "cross-origin", "access-control-allow-origin"),
     "cmdi": ("command injection", "cmdi", "os command", "rce via command", "shell injection"),
 }
+
+
+def register_plugin_prompts() -> list[str]:
+    """Merge any discovered plugin vuln-type prompts into the built-in tables.
+
+    Returns the vuln_type keys that were added/overridden, for logging or
+    tests. Safe to call more than once (idempotent per plugin vuln_type).
+    """
+    added: list[str] = []
+    for plugin in load_plugin_prompts():
+        VULN_TYPE_PROMPTS[plugin.vuln_type] = str(plugin.prompt_path)
+        if plugin.keywords:
+            _VULN_KEYWORDS[plugin.vuln_type] = tuple(plugin.keywords)
+        added.append(plugin.vuln_type)
+    return added
+
+
+register_plugin_prompts()
 
 
 class GenerationError(Exception):
@@ -195,6 +214,8 @@ def _build_result(
     detected_type: Optional[str],
     label: Optional[str],
     refined: bool,
+    cve_id: Optional[str] = None,
+    cwe_id: Optional[str] = None,
 ) -> GenerationResult:
     """Normalize + validate MCP output into a `GenerationResult`."""
     if not raw_output or not raw_output.strip():
@@ -209,6 +230,8 @@ def _build_result(
             default_author=author or "mcp-nuclei",
             default_severity=severity or "medium",
             tags=tags,
+            cve_id=cve_id,
+            cwe_id=cwe_id,
         )
         if template_id:
             normalized["id"] = builder.slugify_id(template_id)
@@ -273,6 +296,8 @@ def generate_from_capture(
     tags: Optional[str] = None,
     auto_classify: bool = False,
     refine: bool = False,
+    cve_id: Optional[str] = None,
+    cwe_id: Optional[str] = None,
 ) -> GenerationResult:
     """Run the generation pipeline for an already-parsed `RequestCapture`."""
     request, response = capture.request, capture.response
@@ -300,6 +325,8 @@ def generate_from_capture(
         detected_type=detected_type,
         label=capture.label,
         refined=False,
+        cve_id=cve_id,
+        cwe_id=cwe_id,
     )
 
     if refine:
@@ -315,6 +342,8 @@ def generate_from_capture(
             detected_type=detected_type,
             label=capture.label,
             refined=True,
+            cve_id=cve_id,
+            cwe_id=cwe_id,
         )
 
     return result
